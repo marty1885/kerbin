@@ -4,6 +4,7 @@ use url::Url;
 
 const HOST: &str = "kerbin.northwire.xyz";
 const INDEX: &str = include_str!("../assets/index.gmi");
+const PRIVACY: &str = include_str!("../assets/privacy.gmi");
 const ROBOTS: &str = "User-agent: *\nDisallow: /\n";
 
 // The capsule listener never delegates to the HTTP/HTTPS proxy.
@@ -36,6 +37,12 @@ pub fn serve(request: &str) -> Response {
             status: 20,
             meta: "text/gemini; charset=utf-8".into(),
             body: INDEX.as_bytes().to_vec(),
+            cacheable: false,
+        },
+        "/privacy" | "/privacy.gmi" => Response {
+            status: 20,
+            meta: "text/gemini; charset=utf-8".into(),
+            body: PRIVACY.as_bytes().to_vec(),
             cacheable: false,
         },
         "/robots.txt" => Response {

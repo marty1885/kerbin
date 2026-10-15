@@ -600,6 +600,27 @@ mod tests {
         wire.extend_from_slice(body);
         wire
     }
+    fn compress(encoding: &str, body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        match encoding {
+            "gzip" => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(body).unwrap();
+                encoder.finish().unwrap()
+            }
+            "br" => {
+                let mut compressed = Vec::new();
+                {
+                    let mut encoder = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+                    encoder.write_all(body).unwrap();
+                }
+                compressed
+            }
+            "zstd" => zstd::stream::encode_all(body, 0).unwrap(),
+            _ => unreachable!(),
+        }
+    }
     #[tokio::test]
     async fn redirects_to_private_ips_ports_schemes_and_dns_rebinding_never_connect() {
         use std::sync::{Arc, Mutex, atomic::Ordering};
@@ -630,7 +651,6 @@ mod tests {
     }
     #[tokio::test]
     async fn declared_chunked_compressed_and_decoded_body_limits_are_enforced() {
-        use std::io::Write;
         let limits = crate::abuse::Limits {
             input_bytes: 128,
             ..Default::default()
@@ -646,21 +666,21 @@ mod tests {
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
         let f = fixture(chunked, limits.clone()).await;
         assert_eq!(f.fetcher.fetch("http://public.example/").await.status, 59);
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&[b'x'; 4096]).unwrap();
-        let compressed = encoder.finish().unwrap();
-        assert!(compressed.len() < 128);
-        let f = fixture(
-            http(
-                "Content-Type: text/plain\r\nContent-Encoding: gzip\r\n",
-                &compressed,
-            ),
-            limits.clone(),
-        )
-        .await;
-        let response = f.fetcher.fetch("http://public.example/").await;
-        assert_eq!(response.status, 59);
-        assert!(response.meta.contains("Decompressed"));
+        for encoding in ["gzip", "br", "zstd"] {
+            let compressed = compress(encoding, &[b'x'; 4096]);
+            assert!(compressed.len() < 128);
+            let f = fixture(
+                http(
+                    &format!("Content-Type: text/plain\r\nContent-Encoding: {encoding}\r\n"),
+                    &compressed,
+                ),
+                limits.clone(),
+            )
+            .await;
+            let response = f.fetcher.fetch("http://public.example/").await;
+            assert_eq!(response.status, 59, "{encoding}");
+            assert!(response.meta.contains("Decompressed"), "{encoding}");
+        }
         let f = fixture(
             http(
                 "Content-Type: text/html; charset=windows-1252\r\n",
@@ -673,21 +693,27 @@ mod tests {
     }
     #[tokio::test]
     async fn successful_compressed_text_and_output_limits() {
-        use std::io::Write;
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(b"<h1>Compressed page</h1>").unwrap();
-        let compressed = encoder.finish().unwrap();
-        let f = fixture(
-            http(
-                "Content-Type: text/html\r\nContent-Encoding: gzip\r\n",
-                &compressed,
-            ),
-            Default::default(),
-        )
-        .await;
-        let response = f.fetcher.fetch("http://public.example/").await;
-        assert_eq!(response.status, 20);
-        assert!(response.text().contains("# Compressed page"));
+        for encoding in ["gzip", "br", "zstd"] {
+            for mime in ["text/html", "text/plain"] {
+                let body = b"<h1>Compressed page</h1>";
+                let compressed = compress(encoding, body);
+                let f = fixture(
+                    http(
+                        &format!("Content-Type: {mime}\r\nContent-Encoding: {encoding}\r\n"),
+                        &compressed,
+                    ),
+                    Default::default(),
+                )
+                .await;
+                let response = f.fetcher.fetch("http://public.example/").await;
+                assert_eq!(response.status, 20, "{encoding}: {mime}");
+                if mime == "text/html" {
+                    assert!(response.text().contains("# Compressed page"), "{encoding}");
+                } else {
+                    assert_eq!(response.body, body, "{encoding}");
+                }
+            }
+        }
         for mime in ["text/html", "text/plain", "text/gemini"] {
             let f = fixture(
                 http(&format!("Content-Type: {mime}\r\n"), &[b'x'; 128]),

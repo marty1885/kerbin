@@ -65,7 +65,7 @@ fn main() -> Result<()> {
         .context("Configure proxy TLS")?;
     let capsule_acceptor = TlsAcceptor::from(Arc::new(capsule_config));
     let proxy_acceptor = TlsAcceptor::from(Arc::new(proxy_config));
-    sandbox::install().context("Install mandatory Linux sandbox")?;
+    sandbox::install().context("Install mandatory process sandbox")?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

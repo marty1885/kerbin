@@ -1,14 +1,53 @@
 //! Install confinement before creating any runtime/worker threads.
 use anyhow::Result;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
 pub fn install() -> Result<()> {
-    anyhow::bail!("Kerbin requires Linux with Landlock ABI v3 and seccomp")
+    anyhow::bail!(
+        "Kerbin requires Linux with Landlock ABI v3 and seccomp, or OpenBSD with pledge and unveil"
+    )
 }
 
 #[cfg(target_os = "linux")]
 pub fn install() -> Result<()> {
     linux::install()
+}
+
+#[cfg(target_os = "openbsd")]
+pub fn install() -> Result<()> {
+    use anyhow::Context;
+    use priv_sep::{Permissions, Promise, Promises, unveil_no_more};
+    use std::io;
+
+    // Unveil cannot revoke access through existing descriptors. As on Linux,
+    // discard inherited handles before confinement, leaving only stdio open.
+    // SAFETY: called during single-threaded startup, after TLS files are closed
+    // and before Tokio creates any runtime descriptors or worker threads.
+    loop {
+        if unsafe { libc::closefrom(3) } == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EBADF) => break, // No descriptors at or above 3 remain.
+            Some(libc::EINTR) => continue,
+            _ => return Err(error).context("Close inherited descriptors"),
+        }
+    }
+
+    for path in ["/etc/resolv.conf", "/etc/hosts", "/dev/urandom"] {
+        Permissions::READ
+            .unveil(path)
+            .with_context(|| format!("Unveil sandbox read allowance: {path}"))?;
+    }
+    unveil_no_more().context("Lock unveil filesystem restrictions")?;
+    // Hickory reads DNS files itself and uses ordinary TCP/UDP sockets; the
+    // libc resolver's `dns` promise is unnecessary. `stdio` covers threads,
+    // kqueue, signals, and entropy. No proc, exec, unix, or prot_exec promises.
+    Promises::new([Promise::Stdio, Promise::Rpath, Promise::Inet])
+        .pledge()
+        .context("Enforce pledge")?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -30,6 +69,24 @@ mod linux {
         ensure!(
             fs::read_dir("/proc/self/task")?.count() == 1,
             "Sandbox must be installed before any threads start"
+        );
+        // Enable inherited, irreversible W^X protection before seccomp limits
+        // prctl. Keep the stricter PROT_EXEC syscall rules as well.
+        // SAFETY: PR_SET_MDWE takes integer arguments only; all variadic
+        // arguments use unsigned long as required by prctl(2).
+        let result = unsafe {
+            libc::prctl(
+                libc::PR_SET_MDWE,
+                libc::PR_MDWE_REFUSE_EXEC_GAIN as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        ensure!(
+            result == 0,
+            "Enable mandatory MDWE (Linux 6.3+ required): {}",
+            io::Error::last_os_error()
         );
         let filters = filters()?;
         // Drop inherited file/socket handles except stdin/stdout/stderr. Landlock

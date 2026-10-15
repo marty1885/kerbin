@@ -14,6 +14,7 @@ kerbin.northwire.xyz:1964
 
 => https://example.com/ Try reading a web page through Kerbin
 => gemini://kerbin.northwire.xyz/ Return to this guide
+=> gemini://kerbin.northwire.xyz/privacy.gmi Privacy policy
 
 ## Other Gemini clients
 

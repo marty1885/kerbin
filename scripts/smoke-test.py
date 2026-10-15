@@ -80,6 +80,11 @@ def main():
                 assert "kerbin.northwire.xyz:1964" in home
                 assert "HTTP proxy field" in home
                 assert request(port, b"gemini://kerbin.northwire.xyz:1965/index.gmi\r\n") == home
+                assert "gemini://kerbin.northwire.xyz/privacy.gmi" in home
+                privacy = request(port, b"gemini://kerbin.northwire.xyz/privacy.gmi\r\n")
+                assert privacy.startswith("20 text/gemini; charset=utf-8\r\n# Privacy policy"), privacy
+                assert "shared in-memory cache" in privacy
+                assert request(port, b"gemini://kerbin.northwire.xyz/privacy\r\n") == privacy
                 robots = request(port, b"gemini://kerbin.northwire.xyz/robots.txt\r\n")
                 assert robots == "20 text/plain; charset=utf-8\r\nUser-agent: *\nDisallow: /\n", robots
                 assert request(port, b"gemini://kerbin.northwire.xyz/missing\r\n").startswith("51 ")

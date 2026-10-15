@@ -1,0 +1,21 @@
+# Privacy policy
+
+Kerbin fetches public web pages on your behalf. To do that, it receives your IP address and the URL you request, including its path and query string. The operator running the service can observe that traffic. Do not send secrets or sensitive URLs.
+
+## What Kerbin keeps
+
+Kerbin has no accounts, tracking cookies, analytics scripts, or per-request access logs. It writes startup messages and aggregate operational counters to standard error, without client IP addresses or requested URLs. The host may retain that output.
+
+Rate limiting keeps client IPv4 addresses or IPv6 /64 prefixes in memory, along with request counters and timing information. Destination hostnames and addresses are also kept in memory for abuse controls and DNS resolution. These are runtime state, not a browsing-history log; rate-limit entries are reclaimed when idle and replenished, as traffic triggers cleanup, or when the process exits.
+
+The shared in-memory cache stores requested URLs and responses. By default, successful responses expire after five minutes and errors after at most ten seconds; the operator can change or disable caching. Other users requesting the same URL may receive the cached response. Responses marked private, no-store, or no-cache, and responses setting cookies, are not retained in that cache. Kerbin does not write this runtime state to files; the host's memory, swap, and crash-dump policies are outside the application.
+
+## Other services
+
+Destination websites receive the requested URL from Kerbin's network address. Kerbin does not forward your client IP address, cookies, or browser headers. DNS resolvers may see the destination hostname. Those services have their own privacy practices.
+
+TLS encrypts the connection between your Gemini client and Kerbin. HTTPS encrypts the upstream connection; ordinary HTTP does not. This is a reading proxy, not an anonymity service.
+
+This policy describes the application. Hosting providers, firewalls, and other infrastructure may have separate logging policies.
+
+=> gemini://kerbin.northwire.xyz/ Back to Kerbin
