@@ -2,38 +2,22 @@
 use anyhow::Result;
 
 #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
-pub fn install() -> Result<()> {
+pub fn install(_keep: &[std::os::fd::RawFd]) -> Result<()> {
     anyhow::bail!(
         "Kerbin requires Linux with Landlock ABI v3 and seccomp, or OpenBSD with pledge and unveil"
     )
 }
 
 #[cfg(target_os = "linux")]
-pub fn install() -> Result<()> {
-    linux::install()
+pub fn install(keep: &[std::os::fd::RawFd]) -> Result<()> {
+    linux::install(keep, Role::Network)
 }
 
 #[cfg(target_os = "openbsd")]
-pub fn install() -> Result<()> {
+pub fn install(keep: &[std::os::fd::RawFd]) -> Result<()> {
     use anyhow::Context;
     use priv_sep::{Permissions, Promise, Promises, unveil_no_more};
-    use std::io;
-
-    // Unveil cannot revoke access through existing descriptors. As on Linux,
-    // discard inherited handles before confinement, leaving only stdio open.
-    // SAFETY: called during single-threaded startup, after TLS files are closed
-    // and before Tokio creates any runtime descriptors or worker threads.
-    loop {
-        if unsafe { libc::closefrom(3) } == 0 {
-            break;
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EBADF) => break, // No descriptors at or above 3 remain.
-            Some(libc::EINTR) => continue,
-            _ => return Err(error).context("Close inherited descriptors"),
-        }
-    }
+    close_inherited(keep)?;
 
     for path in ["/etc/resolv.conf", "/etc/hosts", "/dev/urandom"] {
         Permissions::READ
@@ -51,7 +35,94 @@ pub fn install() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    Network,
+    Supervisor,
+    Parser,
+}
+
+// Only the parser IPC pipes survive startup; certificate and arbitrary inherited
+// handles are never exempted. Call before threads start.
+fn close_inherited(keep: &[std::os::fd::RawFd]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use anyhow::ensure;
+        let mut keep = keep.to_vec();
+        keep.sort_unstable();
+        keep.dedup();
+        let mut first = 3u32;
+        for last in keep.into_iter().filter(|fd| *fd >= 3).map(|fd| fd as u32) {
+            if first < last {
+                // SAFETY: closes only unwanted descriptors during single-threaded startup.
+                let result = unsafe { libc::syscall(libc::SYS_close_range, first, last - 1, 0u32) };
+                ensure!(
+                    result == 0,
+                    "Close inherited descriptors: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            first = last + 1;
+        }
+        // SAFETY: same as above; stdio and explicitly retained IPC are excluded.
+        let result = unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0u32) };
+        ensure!(
+            result == 0,
+            "Close inherited descriptors: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        // SAFETY: queries the descriptor-table limit without pointers.
+        let limit = unsafe { libc::getdtablesize() };
+        for fd in 3..limit {
+            if !keep.contains(&fd) {
+                // SAFETY: closes only unwanted descriptors before worker threads exist.
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn install_parser_supervisor() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::install(&[], Role::Supervisor);
+    #[cfg(target_os = "openbsd")]
+    {
+        use anyhow::Context;
+        close_inherited(&[])?;
+        priv_sep::Permissions::NONE
+            .unveil("/")
+            .context("Hide parser filesystem")?;
+        priv_sep::unveil_no_more().context("Lock parser filesystem")?;
+        return priv_sep::Promises::new([priv_sep::Promise::Stdio, priv_sep::Promise::Proc])
+            .pledge()
+            .context("Confine parser supervisor");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
+    anyhow::bail!("Unsupported parser sandbox platform")
+}
+
+pub fn install_parser_worker() -> Result<()> {
+    close_inherited(&[])?;
+    #[cfg(target_os = "linux")]
+    return linux::apply_filters(Role::Parser);
+    #[cfg(target_os = "openbsd")]
+    {
+        use anyhow::Context;
+        return priv_sep::Promises::new([priv_sep::Promise::Stdio])
+            .pledge()
+            .context("Confine parser worker");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
+    anyhow::bail!("Unsupported parser sandbox platform")
+}
+
+#[cfg(target_os = "linux")]
 mod linux {
+    use super::{Role, close_inherited};
     use anyhow::{Context, Result, ensure};
     use landlock::{
         ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -63,7 +134,7 @@ mod linux {
     };
     use std::{collections::BTreeMap, fs, io};
 
-    pub fn install() -> Result<()> {
+    pub fn install(keep: &[std::os::fd::RawFd], role: Role) -> Result<()> {
         // Landlock v3 is per-thread. Refuse a startup ordering regression that
         // would leave existing threads unconfined; future threads inherit it.
         ensure!(
@@ -88,16 +159,8 @@ mod linux {
             "Enable mandatory MDWE (Linux 6.3+ required): {}",
             io::Error::last_os_error()
         );
-        let filters = filters()?;
-        // Drop inherited file/socket handles except stdin/stdout/stderr. Landlock
-        // cannot revoke access through descriptors opened before confinement.
-        // SAFETY: single-threaded startup, with all certificate file handles closed.
-        let result = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
-        ensure!(
-            result == 0,
-            "Close inherited descriptors: {}",
-            io::Error::last_os_error()
-        );
+        let filters = filters(role)?;
+        close_inherited(keep)?;
         let mut ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(AccessFs::from_all(ABI::V3))?
@@ -105,7 +168,10 @@ mod linux {
             .context("Create Landlock ruleset (Linux 6.2+ with Landlock enabled required)")?;
         // Hickory reads these files directly and uses TCP/UDP DNS. No libc NSS
         // plugins, Unix domain sockets, home directories, or library trees needed.
-        for path in ["/etc/resolv.conf", "/etc/hosts", "/dev/urandom"] {
+        for path in ["/etc/resolv.conf", "/etc/hosts", "/dev/urandom"]
+            .into_iter()
+            .filter(|_| role == Role::Network)
+        {
             match PathFd::new(path) {
                 Ok(fd) => {
                     ruleset = ruleset.add_rule(PathBeneath::new(fd, AccessFs::ReadFile))?;
@@ -140,7 +206,14 @@ mod linux {
         Ok(SeccompRule::new(conditions)?)
     }
 
-    fn filters() -> Result<Vec<BpfProgram>> {
+    pub fn apply_filters(role: Role) -> Result<()> {
+        for filter in filters(role)? {
+            seccompiler::apply_filter_all_threads(&filter).context("Confine parser worker")?;
+        }
+        Ok(())
+    }
+
+    fn filters(role: Role) -> Result<Vec<BpfProgram>> {
         let arch = std::env::consts::ARCH.try_into()?;
         // glibc falls back to clone when clone3 returns ENOSYS. clone3's flags
         // are behind a pointer and cannot be safely inspected by classic BPF.
@@ -357,8 +430,68 @@ mod linux {
                 std::process::id() as u64,
             )?])?],
         );
-        // No exec, fork/vfork, ptrace, process_vm_*, mount, namespaces, io_uring,
-        // BPF, keyrings, arbitrary ioctl, file mutation, or new seccomp policies.
+        // Reap startup parser supervisors without allowing the network process
+        // to create or signal processes.
+        rules.insert(libc::SYS_wait4, vec![]);
+        if role != Role::Network {
+            for syscall in [
+                libc::SYS_socket,
+                libc::SYS_socketpair,
+                libc::SYS_connect,
+                libc::SYS_bind,
+                libc::SYS_listen,
+                libc::SYS_accept4,
+                libc::SYS_sendto,
+                libc::SYS_sendmsg,
+                libc::SYS_sendmmsg,
+                libc::SYS_openat,
+            ] {
+                rules.remove(&syscall);
+            }
+            #[cfg(target_arch = "x86_64")]
+            rules.remove(&libc::SYS_open);
+            rules.remove(&libc::SYS_clone);
+            rules.insert(libc::SYS_close_range, vec![]);
+        }
+        if role == Role::Supervisor {
+            // The supervisor handles bounded binary framing only. Untrusted
+            // HTML is parsed after a second filter removes these privileges.
+            let fork_flags =
+                (libc::SIGCHLD | libc::CLONE_CHILD_SETTID | libc::CLONE_CHILD_CLEARTID) as u64;
+            rules.insert(
+                libc::SYS_clone,
+                vec![rule(vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::MaskedEq(!fork_flags),
+                        0,
+                    )?,
+                    condition(0, SeccompCmpOp::MaskedEq(0xff), libc::SIGCHLD as u64)?,
+                ])?],
+            );
+            #[cfg(target_arch = "x86_64")]
+            rules.insert(libc::SYS_fork, vec![]);
+            for syscall in [
+                libc::SYS_kill,
+                libc::SYS_setrlimit,
+                libc::SYS_prlimit64,
+                libc::SYS_pipe2,
+                libc::SYS_dup3,
+            ] {
+                rules.insert(syscall, vec![]);
+            }
+            #[cfg(target_arch = "x86_64")]
+            for syscall in [libc::SYS_pipe, libc::SYS_dup2] {
+                rules.insert(syscall, vec![]);
+            }
+            // Workers can only add restrictions to the inherited sandbox.
+            rules.insert(libc::SYS_seccomp, vec![]);
+            rules.insert(libc::SYS_prctl, vec![]);
+        }
+        // The network process and parser workers cannot exec, fork/vfork,
+        // ptrace, mount, create namespaces, or install new seccomp policies.
+        // Only the framing supervisor can fork and further confine its children.
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::Errno(libc::EPERM as u32),

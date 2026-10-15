@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::render::html_to_gemtext;
 #[cfg(test)]
 use reqwest::Client;
@@ -18,7 +19,7 @@ impl Response {
             status,
             meta: meta.into(),
             body: Vec::new(),
-            cacheable: true,
+            cacheable: status != 44,
         }
     }
     #[cfg(test)]
@@ -95,15 +96,21 @@ pub struct Fetcher {
     pub guard: crate::abuse::Guard,
     dns: crate::destination::Dns,
     full_page: bool,
+    parsers: Option<crate::parser::Pool>,
     #[cfg(test)]
     fixture_client: Option<Client>,
 }
 impl Fetcher {
-    pub fn new(guard: crate::abuse::Guard, full_page: bool) -> anyhow::Result<Self> {
+    pub fn new(
+        guard: crate::abuse::Guard,
+        full_page: bool,
+        parsers: crate::parser::Pool,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             guard,
             dns: crate::destination::Dns::new()?,
             full_page,
+            parsers: Some(parsers),
             #[cfg(test)]
             fixture_client: None,
         })
@@ -133,7 +140,14 @@ impl Fetcher {
             ),
         }
     }
-    async fn fetch_inner(&self, mut url: Url) -> Response {
+    async fn fetch_inner(&self, url: Url) -> Response {
+        let mut cacheable = true;
+        let mut response = self.fetch_chain(url, &mut cacheable).await;
+        response.cacheable &= cacheable;
+        response
+    }
+    async fn fetch_chain(&self, mut url: Url, chain_cacheable: &mut bool) -> Response {
+        let deadline = tokio::time::Instant::now() + self.guard.limits.timeout;
         use crate::{abuse::Stats, render::RenderError};
         use reqwest::header::LOCATION;
         for hop in 0..=self.guard.limits.redirects {
@@ -168,6 +182,7 @@ impl Fetcher {
                 Ok(response) => response,
                 Err(error) => return self.upstream_error(&error),
             };
+            *chain_cacheable &= allows_cache(response.headers());
             if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 if hop == self.guard.limits.redirects {
                     return Response::error(43, "Upstream redirect limit exceeded");
@@ -187,7 +202,7 @@ impl Fetcher {
                 // The next iteration revalidates DNS, IPs, ports, and admission.
                 continue;
             }
-            let cacheable = allows_cache(response.headers());
+            let cacheable = *chain_cacheable;
             if !response.status().is_success() {
                 let mut error = Response::error(
                     match response.status() {
@@ -198,7 +213,7 @@ impl Fetcher {
                     },
                     &format!("Upstream HTTP {}", response.status().as_u16()),
                 );
-                error.cacheable = cacheable;
+                error.cacheable = cacheable && error.status != 44;
                 return error;
             }
             let content_type = response
@@ -291,30 +306,45 @@ impl Fetcher {
             };
             let full_page = self.full_page;
             let output_limit = self.guard.limits.output_bytes;
-            let body = tokio::task::spawn_blocking(move || {
-                // A timeout does not interrupt synchronous parsing: this permit
-                // stays with the physical worker until it actually finishes.
-                let _parser = parser;
-                html_to_gemtext(&text, &url, full_page, output_limit)
-            })
-            .await;
+            let body = if let Some(pool) = &self.parsers {
+                pool.render(text, url, full_page, output_limit, deadline, parser)
+                    .await
+            } else {
+                #[cfg(test)]
+                {
+                    tokio::task::spawn_blocking(move || {
+                        let _parser = parser;
+                        html_to_gemtext(&text, &url, full_page, output_limit)
+                    })
+                    .await
+                    .map_err(|_| crate::parser::Error::Failed)
+                    .and_then(|result| result.map_err(crate::parser::Error::Render))
+                }
+                #[cfg(not(test))]
+                {
+                    return Response::error(43, "Parser supervisor unavailable");
+                }
+            };
             return match body {
-                Ok(Ok(body)) => Response {
+                Ok(body) => Response {
                     status: 20,
                     meta: "text/gemini; charset=utf-8".into(),
                     body: body.into_bytes(),
                     cacheable,
                 },
-                Ok(Err(RenderError::TooLarge)) => Stats::reject(
+                Err(crate::parser::Error::Render(RenderError::TooLarge)) => Stats::reject(
                     &self.guard.stats.oversized,
                     59,
                     "Gemtext output size limit exceeded",
                 ),
-                Ok(Err(RenderError::TooComplex)) => Stats::reject(
+                Err(crate::parser::Error::Render(RenderError::TooComplex)) => Stats::reject(
                     &self.guard.stats.oversized,
                     59,
                     "HTML complexity limit exceeded",
                 ),
+                Err(crate::parser::Error::TimedOut) => {
+                    Stats::reject(&self.guard.stats.timed_out, 44, "Parser deadline exceeded")
+                }
                 Err(_) => {
                     Stats::reject(&self.guard.stats.upstream, 43, "Upstream rendering failed")
                 }
@@ -493,6 +523,7 @@ mod tests {
                 vec!["8.8.8.8".parse().unwrap()],
             )])),
             full_page: false,
+            parsers: None,
             fixture_client: Some(client),
         };
         let response = fetcher.fetch("http://public.example/redirect").await;
@@ -537,6 +568,13 @@ mod tests {
         limits: crate::abuse::Limits,
         delay: std::time::Duration,
     ) -> Fixture {
+        fixture_sequence(vec![wire], limits, delay).await
+    }
+    async fn fixture_sequence(
+        wires: Vec<Vec<u8>>,
+        limits: crate::abuse::Limits,
+        delay: std::time::Duration,
+    ) -> Fixture {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -552,8 +590,8 @@ mod tests {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (mut socket, _) = accepted.unwrap();
-                        observed.fetch_add(1, Ordering::SeqCst);
-                        let wire = wire.clone();
+                        let index = observed.fetch_add(1, Ordering::SeqCst);
+                        let wire = wires[index.min(wires.len() - 1)].clone();
                         jobs.spawn(async move {
                             let mut request = Vec::new();
                             let mut buffer = [0; 1024];
@@ -585,6 +623,7 @@ mod tests {
                     ("private.example".into(), vec!["127.0.0.1".parse().unwrap()]),
                 ])),
                 full_page: false,
+                parsers: None,
                 fixture_client: Some(client),
             },
             count,
@@ -599,6 +638,81 @@ mod tests {
         .into_bytes();
         wire.extend_from_slice(body);
         wire
+    }
+    #[tokio::test]
+    async fn redirects_carry_cache_restrictions_through_to_success_and_errors() {
+        use std::{sync::atomic::Ordering, time::Duration};
+        for restriction in [
+            "Cache-Control: no-store",
+            "Cache-Control: private",
+            "Cache-Control: no-cache",
+            "Set-Cookie: session=abc",
+            "Vary: *",
+        ] {
+            for final_status in ["200 OK", "404 Not Found"] {
+                let first = format!("HTTP/1.1 302 Found\r\nLocation: /second\r\n{restriction}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes();
+                let second = b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+                let final_response = format!("HTTP/1.1 {final_status}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").into_bytes();
+                let f = fixture_sequence(
+                    vec![
+                        first.clone(),
+                        second.clone(),
+                        final_response.clone(),
+                        first,
+                        second,
+                        final_response,
+                    ],
+                    crate::abuse::Limits {
+                        global_burst: 20,
+                        destination_burst: 20,
+                        ..Default::default()
+                    },
+                    Duration::ZERO,
+                )
+                .await;
+                let cache = crate::cache::Cache::new(4096, Duration::from_secs(60));
+                for _ in 0..2 {
+                    let result = serve_proxy(&f.fetcher, &cache, "http://public.example/").await;
+                    assert!(result.starts_with(if final_status == "200 OK" {
+                        b"20 "
+                    } else {
+                        b"51 "
+                    }));
+                }
+                assert_eq!(
+                    f.count.load(Ordering::SeqCst),
+                    6,
+                    "{restriction}: {final_status}"
+                );
+                assert_eq!(cache.stats().hits.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn upstream_throttling_is_never_cached() {
+        use std::{sync::atomic::Ordering, time::Duration};
+        let f = fixture_sequence(
+            vec![
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+                http("Content-Type: text/plain\r\n", b"Recovered"),
+            ],
+            Default::default(),
+            Duration::ZERO,
+        )
+        .await;
+        let cache = crate::cache::Cache::new(4096, Duration::from_secs(60));
+        assert!(
+            serve_proxy(&f.fetcher, &cache, "http://public.example/")
+                .await
+                .starts_with(b"44 ")
+        );
+        assert!(
+            serve_proxy(&f.fetcher, &cache, "http://public.example/")
+                .await
+                .ends_with(b"Recovered")
+        );
+        assert_eq!(f.count.load(Ordering::SeqCst), 2);
     }
     fn compress(encoding: &str, body: &[u8]) -> Vec<u8> {
         use std::io::Write;

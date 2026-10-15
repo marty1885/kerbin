@@ -2,6 +2,7 @@ mod abuse;
 mod cache;
 mod destination;
 mod landing;
+mod parser;
 mod proxy;
 mod render;
 mod sandbox;
@@ -48,7 +49,12 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--parser-supervisor")) {
+        return parser::supervise();
+    }
     let args = Args::parse();
+    // Start supervisors before loading TLS secrets or creating worker threads.
+    let parsers = parser::Pool::new(args.safety.limits().parsers)?;
     let certs = CertificateDer::pem_file_iter(&args.cert)
         .context("Read certificate file")?
         .collect::<Result<Vec<_>, _>>()
@@ -65,12 +71,12 @@ fn main() -> Result<()> {
         .context("Configure proxy TLS")?;
     let capsule_acceptor = TlsAcceptor::from(Arc::new(capsule_config));
     let proxy_acceptor = TlsAcceptor::from(Arc::new(proxy_config));
-    sandbox::install().context("Install mandatory process sandbox")?;
+    sandbox::install(&parsers.descriptors()).context("Install mandatory process sandbox")?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Start confined Tokio runtime")?
-        .block_on(serve(args, capsule_acceptor, proxy_acceptor))
+        .block_on(serve(args, capsule_acceptor, proxy_acceptor, parsers))
 }
 
 struct ProxyService {
@@ -110,9 +116,10 @@ async fn serve(
     args: Args,
     capsule_acceptor: TlsAcceptor,
     proxy_acceptor: TlsAcceptor,
+    parsers: parser::Pool,
 ) -> Result<()> {
     let guard = abuse::Guard::new(args.safety.limits());
-    let fetcher = proxy::Fetcher::new(guard.clone(), args.full_page)
+    let fetcher = proxy::Fetcher::new(guard.clone(), args.full_page, parsers)
         .context("Initialize confined DNS resolver")?;
     let cache = cache::Cache::new(
         args.cache_max_bytes,

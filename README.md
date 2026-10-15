@@ -32,6 +32,7 @@ In Lagrange, open **Preferences -> Proxies** (the **Network** panel on mobile) a
 - Fetches HTTP and HTTPS with verified upstream TLS, up to five redirects, and a 30-second deadline.
 - Detects article pages with `dom_smoothie` (Readability) and keeps only the main content. Pass `--full-page` to keep navigation and everything else.
 - Parses HTML without running JavaScript and renders titles, headings, paragraphs, lists, quotes, preformatted text, and basic tables.
+- Runs each HTML parser in a disposable process with a 512 MiB address-space limit on Linux (data-segment limit on OpenBSD), a CPU limit, and a wall deadline within the fetch timeout. Supervisors kill and reap overdue workers before reusing the slot. Parser workers have no filesystem, network, execution, or process-creation access. Supervisors start before TLS keys are loaded; the network process still cannot create processes. OpenBSD remains best effort and untested.
 - Turns links into numbered references in the prose and places Gemtext links after each paragraph. Web links stay as HTTP/HTTPS URLs, so Lagrange sends later visits through the proxy too.
 - Handles gzip, brotil and zstd compressed responses
 - Converts only HTML and XHTML. Every other content type, including images, plain text, and PDFs, passes through with its original MIME type and bytes.
@@ -47,7 +48,7 @@ cargo run -- --cert certs/cert.pem --key certs/key.pem \
   --cache-ttl-secs 120 --cache-max-bytes 33554432
 ```
 
-Simultaneous requests for the same URL share one fetch. Responses marked `no-store`, `no-cache`, or `private`, responses with `Set-Cookie`, and responses with `Vary: *` are never stored. Upstream errors are cached for at most ten seconds.
+Simultaneous requests for the same URL share one fetch. Responses marked `no-store`, `no-cache`, or `private`, responses with `Set-Cookie`, and responses with `Vary: *` are never stored, including when those restrictions appear on any redirect in the chain. Upstream errors are cached for at most ten seconds.
 
 ## Abuse prevention
 

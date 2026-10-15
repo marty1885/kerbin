@@ -129,7 +129,11 @@ impl Cache {
                         .saturating_add(ENTRY_OVERHEAD);
                     let mut state = inner.state.lock().unwrap();
                     state.purge(Instant::now());
-                    if response.cacheable && !ttl.is_zero() && weight <= inner.max_bytes {
+                    if response.status != 44
+                        && response.cacheable
+                        && !ttl.is_zero()
+                        && weight <= inner.max_bytes
+                    {
                         while state.bytes > inner.max_bytes - weight {
                             let (_, entry) = state.entries.pop_lru().unwrap();
                             state.bytes -= entry.weight;

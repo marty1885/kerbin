@@ -4,6 +4,10 @@ import argparse
 import contextlib
 import http.server
 import pathlib
+import os
+import select
+import signal
+import struct
 import socket
 import ssl
 import subprocess
@@ -25,6 +29,79 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def verify_parser(binary):
+    # Exercise the real confined supervisor, not the unit-test renderer.
+    with subprocess.Popen([binary, "--parser-supervisor"], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, bufsize=0) as process:
+        def read_exact(size):
+            data = bytearray()
+            deadline = time.monotonic() + 10
+            while len(data) < size:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0 and select.select([process.stdout], [], [], remaining)[0], "Parser hung"
+                chunk = os.read(process.stdout.fileno(), size - len(data))
+                assert chunk, "Parser supervisor exited unexpectedly"
+                data.extend(chunk)
+            return bytes(data)
+
+        def send_job(html, timeout_ms=1000, output_limit=4096):
+            url = b"https://example.org/"
+            payload = struct.pack(">QQBQQ", timeout_ms, output_limit, 0, len(url), len(html)) + url + html
+            # Raw pipes can perform short writes.
+            while payload:
+                payload = payload[os.write(process.stdin.fileno(), payload):]
+
+        def result():
+            status = read_exact(1)[0]
+            return status, read_exact(struct.unpack(">Q", read_exact(8))[0])
+
+        def job(html, timeout_ms=1000, output_limit=4096):
+            send_job(html, timeout_ms, output_limit)
+            return result()
+
+        assert read_exact(1) == b"R", "Parser sandbox failed startup self-check"
+        assert job(b"<h1>Isolated page</h1>") == (0, b"# Isolated page\n\n")
+        assert job(b"<p>Too much output</p>", output_limit=4) == (1, b"")
+        assert job(b"<div>" * 200 + b"deep" + b"</div>" * 200) == (2, b"")
+        start = time.monotonic()
+        assert job(b"<span>x</span>" * 150000, timeout_ms=1) == (4, b""), "Parser did not enforce wall deadline"
+        assert time.monotonic() - start < 5, "Parser timeout took too long"
+        children = pathlib.Path(f"/proc/{process.pid}/task/{process.pid}/children")
+        if children.exists():
+            assert not children.read_text().strip(), "Timed-out parser was not reaped"
+        assert job(b"<p>Recovered</p>") == (0, b"Recovered\n\n"), "Parser slot did not recover"
+        if children.exists():
+            # Verify actual OS limits, then simulate a parser crash and recover.
+            send_job(b"<span>x</span>" * 150000, timeout_ms=5000)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                pids = children.read_text().split()
+                if pids:
+                    pid = int(pids[0])
+                    try:
+                        limits = pathlib.Path(f"/proc/{pid}/limits").read_text()
+                    except FileNotFoundError:
+                        continue
+                    address_limit = next(line for line in limits.splitlines() if line.startswith("Max address space"))
+                    if "536870912" in address_limit:
+                        assert address_limit.split()[-3:-1] == ["536870912", "536870912"]
+                        core_limit = next(line for line in limits.splitlines() if line.startswith("Max core file size"))
+                        assert core_limit.split()[-3:-1] == ["0", "0"]
+                        cpu_limit = next(line for line in limits.splitlines() if line.startswith("Max cpu time"))
+                        assert "unlimited" not in cpu_limit
+                        os.kill(pid, signal.SIGKILL)
+                        break
+                time.sleep(0.001)
+            else:
+                raise AssertionError("Could not verify parser memory/CPU limits")
+            assert result() == (3, b""), "Parser crash was not contained"
+            assert not children.read_text().strip(), "Crashed parser was not reaped"
+            assert job(b"<p>Still alive</p>") == (0, b"Still alive\n\n")
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0
+    print("PASS: isolated parser, output/complexity limits, hard timeout and recovery (Linux: OS resource limits, crash containment, and child reaping)")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/kerbin")
@@ -32,6 +109,7 @@ def main():
     parser.add_argument("--image-url", help="Optional public image fetch and binary cache check")
     args = parser.parse_args()
     binary = str(pathlib.Path(args.binary).resolve())
+    verify_parser(binary)
     fixture = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
     threading.Thread(target=fixture.serve_forever, daemon=True).start()
     try:
