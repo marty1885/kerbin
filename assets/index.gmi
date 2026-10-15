@@ -1,0 +1,36 @@
+# Kerbin
+
+Kerbin is a Gemini-to-HTTP proxy at kerbin.northwire.xyz that lets you read public HTTP and HTTPS web pages in your Gemini client, extracting readable content and converting it to Gemtext.
+
+## Use Kerbin with Lagrange
+
+1. Open Preferences, then Proxies (on mobile, the Network panel), and set the HTTP proxy field to the address below.
+
+```
+kerbin.northwire.xyz:1964
+```
+
+2. Save, then open any ordinary http:// or https:// URL in Lagrange. The HTTP proxy field covers both schemes; enter only the host and port, without gemini://, and include :1964 because Lagrange defaults to port 1965, which serves this guide rather than the proxy.
+
+=> https://example.com/ Try reading a web page through Kerbin
+=> gemini://kerbin.northwire.xyz/ Return to this guide
+
+## Other Gemini clients
+
+Your client must support HTTP and HTTPS scheme proxies over Gemini: set the proxy to kerbin.northwire.xyz on port 1964, then navigate to the original web URL without wrapping it in gemini://. A browser-style HTTP proxy or HTTP CONNECT setting will not work with this service.
+
+## What to expect
+
+* Web pages become text, headings, lists, quotes, and links.
+* Links stay as ordinary web URLs, so your proxy setting also handles the next page.
+* Image links can be opened or shown inline by clients such as Lagrange.
+* Other file types keep their original type, and viewing them depends on your client.
+* JavaScript, sign-ins, and form submissions are not supported.
+* Pages may come from a short-lived cache.
+* Only public destinations on HTTP port 80 and HTTPS port 443 are supported.
+
+Very large or complex pages may be refused, and a temporary rate or capacity limit means you should wait before trying again.
+
+## Known issues
+
+Fetching https://www.fsf.org/ currently fails because its TLS cipher suites are incompatible with Kerbin's TLS backend. We are aware of the issue.
