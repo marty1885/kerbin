@@ -1,6 +1,26 @@
-# Kerbin
+# 🪐 Kerbin
 
-Free to use Gemini-to-HTTP proxy that lets you read public HTTP and HTTPS web pages and images in your Gemini client.
+Free Gemini-to-HTTP proxy that lets you read public HTTP and HTTPS web pages and images in your Gemini client.
+
+```
+.         _  .          .          .    +     .          .          .      .
+        .(_)          .            .            .            .       :
+        .   .      .    .     .     .    .      .   .      . .  .  -+-        .
+          .           .   .        .           .          /         :  .
+    . .        .  .      /.   .      .    .     .     .  / .      . ' .
+        .  +       .    /     .          .          .   /      .
+       .            .  /         .            .        *   .         .     .
+      .   .      .    *     .     .    .      .   .       .  .
+          .           .           .           .           .         +  .
+  . .        .  .       .   .      .    .     .     .    .      .   .
+
+ .   +      .          ___/\_._/~~\_...__/\__.._._/~\        .         .   .
+       .          _.--'                              `--./\          .   .
+           /~~\/~\                                         `-/~\_            .
+ .      .-'                                                      `-/\_
+  _/\.-'                                                          __/~\/\-.__
+.'                                                                           `
+```
 
 => https://github.com/marty1885/kerbin Kerbin source code.
 
